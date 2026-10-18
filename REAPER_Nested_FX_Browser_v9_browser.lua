@@ -149,6 +149,7 @@ local folderMap = loadMap()
 local savedFolders = loadFolders()
 local selectedFX, selectedFolder = 1, "All FX"
 local selectedFXKeys = {} -- multi-selection by stable plugin identifier
+local selectionCleared = false -- distinguishes an intentionally empty selection from the default row
 local selectedManufacturer = nil
 local search = ""
 local searchFocused = false
@@ -362,7 +363,7 @@ local function addSelected()
   for _, fx in ipairs(visible) do
     if selectedFXKeys[fx.key] then targets[#targets+1] = fx end
   end
-  if #targets == 0 and next(selectedFXKeys) == nil and visible[selectedFX] then targets[1] = visible[selectedFX] end
+  if #targets == 0 and not selectionCleared and next(selectedFXKeys) == nil and visible[selectedFX] then targets[1] = visible[selectedFX] end
   if #targets == 0 then status = "Select a plugin first."; return end
   local added = 0
   for _, fx in ipairs(targets) do if addFX(fx) then added = added + 1 end end
@@ -372,10 +373,12 @@ end
 local function clearSelectionExcept(key)
   selectedFXKeys = {}
   if key then selectedFXKeys[key] = true end
+  selectionCleared = key == nil
 end
 
 local function toggleSelection(key)
   if selectedFXKeys[key] then selectedFXKeys[key] = nil else selectedFXKeys[key] = true end
+  selectionCleared = next(selectedFXKeys) == nil
 end
 
 local function modifierHeld(cap)
@@ -597,59 +600,32 @@ local function draw()
   if selectedFX > #visible then selectedFX = math.max(1, #visible) end
   if selectedFX < 1 then selectedFX = 1 end
 
+  -- The right pane is a plugin list only. Folder hierarchy belongs exclusively
+  -- in the left tree, where each parent folder can be expanded/collapsed.
   local displayRows = {}
-  local folderSet = {}
-  if selectedFolder == "My Folders" then
-    for _, p in ipairs(allFolders()) do
-      if p ~= "All FX" and p ~= "Unsorted" and not p:find("/", 1, true) then
-        folderSet[p] = true
-      end
-    end
-  elseif selectedFolder ~= "All FX" and selectedFolder ~= "Unsorted" and not selectedManufacturer then
-    local prefix = selectedFolder .. "/"
-    for _, p in ipairs(allFolders()) do
-      if p:sub(1, #prefix) == prefix then
-        local rest = p:sub(#prefix + 1)
-        if rest ~= "" and not rest:find("/", 1, true) then folderSet[p] = true end
-      end
-    end
-  end
-  local childPaths = {}
-  for p in pairs(folderSet) do childPaths[#childPaths+1] = p end
-  table.sort(childPaths, function(a,b) return a:lower() < b:lower() end)
-  for _, p in ipairs(childPaths) do
-    displayRows[#displayRows+1] = {kind="folderEntry", path=p, name=p:match("([^/]+)$")}
-  end
   for n, fx in ipairs(visible) do
     displayRows[#displayRows+1] = {kind="pluginEntry", fx=fx, pluginIndex=n}
   end
 
-  text(rightX+7,94,(selectedManufacturer and (selectedManufacturer .. " — ") or "") .. ("Entries (%d; %d plugins)"):format(#displayRows,#visible),0.72,0.80,0.88)
+  text(rightX+7,94,(selectedManufacturer and (selectedManufacturer .. " — ") or "") .. ("Plugins (%d)"):format(#visible),0.72,0.80,0.88)
   local start = math.max(1, scroll + 1)
   local maxRows = math.floor((listH - 12) / rowHeight)
   if start > math.max(1,#displayRows-maxRows+1) then start = math.max(1,#displayRows-maxRows+1) end
   for n = start, math.min(#displayRows, start + maxRows - 1) do
     local y = listY + 7 + (n-start)*rowHeight
     local entry = displayRows[n]
-    if entry.kind == "folderEntry" then
-      text(rightX+10,y,"▸  " .. entry.name,0.96,0.82,0.42)
-      text(rightX + math.floor((winW-rightX)*0.57),y,"Folder",0.55,0.65,0.72)
-      text(rightX + math.floor((winW-rightX)*0.74),y,entry.path,0.50,0.63,0.68)
-      rows[#rows+1] = {kind="folderEntry", value=entry.path, x=rightX, y=y-2, w=winW-rightX-32, h=rowHeight}
-    else
-      local fx = entry.fx
-      local pluginIndex = entry.pluginIndex
-      local isSelected = selectedFXKeys[fx.key] or (next(selectedFXKeys) == nil and pluginIndex == selectedFX)
-      if isSelected then color(0.22,0.31,0.38,1); gfx.rect(rightX+4,y-2,winW-rightX-22,rowHeight,1) end
-      if gfx.setclip then gfx.setclip(rightX+8,y-2,math.max(40,winW-rightX-20),rowHeight) end
-      fitText(rightX+10,y,fx.name,math.max(40, math.floor((winW-rightX)*0.55)-14), isSelected and 1 or 0.88, isSelected and 0.91 or 0.89, isSelected and 0.58 or 0.90)
-      if gfx.setclip then gfx.setclip(0,0,winW,winH) end
-      local fmtX = rightX + math.floor((winW-rightX)*0.57)
-      text(fmtX,y,fx.format,0.55,0.65,0.72)
-      local path = folderMap[fx.key] or ""
-      text(rightX + math.floor((winW-rightX)*0.74),y,path ~= "" and path or "—",0.50,0.63,0.68)
-      rows[#rows+1] = {kind="plugin", value=fx, index=pluginIndex, x=rightX, y=y-2, w=winW-rightX-32, h=rowHeight}
-    end
+    local fx = entry.fx
+    local pluginIndex = entry.pluginIndex
+    local isSelected = selectedFXKeys[fx.key] or (not selectionCleared and next(selectedFXKeys) == nil and pluginIndex == selectedFX)
+    if isSelected then color(0.22,0.31,0.38,1); gfx.rect(rightX+4,y-2,winW-rightX-22,rowHeight,1) end
+    if gfx.setclip then gfx.setclip(rightX+8,y-2,math.max(40,winW-rightX-20),rowHeight) end
+    fitText(rightX+10,y,fx.name,math.max(40, math.floor((winW-rightX)*0.55)-14), isSelected and 1 or 0.88, isSelected and 0.91 or 0.89, isSelected and 0.58 or 0.90)
+    if gfx.setclip then gfx.setclip(0,0,winW,winH) end
+    local fmtX = rightX + math.floor((winW-rightX)*0.57)
+    text(fmtX,y,fx.format,0.55,0.65,0.72)
+    local path = folderMap[fx.key] or ""
+    text(rightX + math.floor((winW-rightX)*0.74),y,path ~= "" and path or "—",0.50,0.63,0.68)
+    rows[#rows+1] = {kind="plugin", value=fx, index=pluginIndex, x=rightX, y=y-2, w=winW-rightX-32, h=rowHeight}
   end
 
   -- Visible draggable scrollbar for the right pane.
@@ -829,8 +805,10 @@ local function loop()
       if path then createFolderFromInput(path) end
     else
       if formatMenuOpen and not (mx >= winW-486 and mx <= winW-330 and my >= 88 and my <= 88+7*24+10) then formatMenuOpen = false end
+      local clickedRow = false
       for _, row in ipairs(rows) do
         if mx >= row.x and mx <= row.x+row.w and my >= row.y and my <= row.y+row.h then
+          clickedRow = true
           if row.kind == "formatToggle" then
             formatEnabled[row.value] = not formatEnabled[row.value]; saveFormatState()
           elseif row.kind == "manufacturerHeader" then
@@ -878,6 +856,10 @@ local function loop()
           end
           break
         end
+      end
+      if not clickedRow then
+        -- Clicking empty space clears the plugin selection without interfering with drag start.
+        clearSelectionExcept(nil)
       end
     end
   end
