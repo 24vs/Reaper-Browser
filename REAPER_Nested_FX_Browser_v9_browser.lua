@@ -1,20 +1,17 @@
 -- REAPER Nested FX Browser — fixed
 -- Uses REAPER's existing FX inventory. No network, no rescan, no plugin loading until Add.
--- Folder assignments are stored in REAPER ExtState and do not modify project/plugin files.
+-- Browser data is stored in a private sidecar file beside this script; REAPER settings/projects are not used for persistence.
 -- Folder paths use "/" separators, e.g. Delay/Waves or Delay/Valhalla.
 -- Requires a REAPER version exposing EnumInstalledFX and TrackFX_AddByName.
 
 local SECTION = "VSoundNestedFXBrowser"
-local KEY = "folder_map_v1"
-local FOLDERS_KEY = "folders_v1"
-local FOLDER_ORDER_KEY = "folder_order_v1"
-local GEOMETRY_KEY = "window_geometry_v1"
 local RUN_KEY = "running_v9"
 local CLOSE_KEY = "close_request_v9"
--- This is the worker window. Use the companion *_launcher.lua for the toolbar button.
-reaper.SetExtState(SECTION, RUN_KEY, "1", false)
-reaper.SetExtState(SECTION, CLOSE_KEY, "", false)
-
+-- Run this script directly from REAPER's Actions list. Running it again closes the open browser.
+if reaper.GetExtState(SECTION, RUN_KEY) == "1" then
+  reaper.SetExtState(SECTION, CLOSE_KEY, "1", false)
+  return
+end
 if not reaper.EnumInstalledFX then
   reaper.ShowMessageBox("EnumInstalledFX is unavailable in this REAPER version.", "Nested FX Browser", 0)
   return
@@ -30,65 +27,80 @@ local function split(s, sep)
   return out
 end
 
-local function loadMap()
-  local map = {}
-  local raw = reaper.GetExtState(SECTION, KEY)
-  for line in (raw .. "\n"):gmatch("(.-)\n") do
-    if line ~= "" then
-      local tab = line:find("\t", 1, true)
-      if tab then map[line:sub(1, tab - 1)] = line:sub(tab + 1) end
-    end
-  end
-  return map
+-- All persistent browser data is stored in a private sidecar file, not in REAPER ExtState.
+-- Keep REAPER_Nested_FX_Folder_Storage.lua beside this browser script.
+local scriptSource = debug.getinfo(1, "S").source or ""
+local scriptPath = scriptSource:sub(1, 1) == "@" and scriptSource:sub(2) or ""
+local scriptDir = scriptPath:match("^(.*[\\/])")
+if not scriptDir then
+  reaper.ShowMessageBox("Could not determine the browser script folder. Save the browser as a Lua file before running it.", "Nested FX Browser", 0)
+  return
+end
+local storagePath = scriptDir .. "REAPER_Nested_FX_Folder_Storage.lua"
+local storageOK, FolderStorage = pcall(dofile, storagePath)
+if not storageOK or type(FolderStorage) ~= "table"
+  or type(FolderStorage.loadMap) ~= "function"
+  or type(FolderStorage.loadFolders) ~= "function"
+  or type(FolderStorage.loadFolderOrder) ~= "function"
+  or type(FolderStorage.getSetting) ~= "function"
+  or type(FolderStorage.setSetting) ~= "function" then
+  reaper.ShowMessageBox(
+    "The browser's private storage module could not be loaded:\n\n" .. storagePath ..
+    "\n\nKeep both Lua files in the same folder. REAPER settings have not been changed.",
+    "Nested FX Browser", 0)
+  return
 end
 
-local function loadFolders()
-  local set = {}
-  local raw = reaper.GetExtState(SECTION, FOLDERS_KEY)
-  for line in (raw .. "\n"):gmatch("(.-)\n") do
-    if line ~= "" then set[line] = true end
-  end
-  return set
+-- One-time, read-only import of the old browser data from REAPER ExtState.
+-- It preserves existing folders/assignments but never writes anything back to REAPER.
+if FolderStorage.needsLegacyImport and FolderStorage.needsLegacyImport() then
+  FolderStorage.importLegacy({
+    map = reaper.GetExtState(SECTION, "folder_map_v1"),
+    folders = reaper.GetExtState(SECTION, "folders_v1"),
+    order = reaper.GetExtState(SECTION, "folder_order_v1"),
+    settings = {
+      formats_v1 = reaper.GetExtState(SECTION, "formats_v1"),
+      ui_state_v1 = reaper.GetExtState(SECTION, "ui_state_v1"),
+      color_theme_v1 = reaper.GetExtState(SECTION, "color_theme_v1"),
+      window_geometry_v1 = reaper.GetExtState(SECTION, "window_geometry_v1")
+    }
+  })
 end
 
-local function loadFolderOrder()
-  local order, raw = {}, reaper.GetExtState(SECTION, FOLDER_ORDER_KEY)
-  for line in (raw .. "\n"):gmatch("(.-)\n") do
-    if line ~= "" then order[#order + 1] = line end
-  end
-  return order
-end
-
+local function loadMap() return FolderStorage.loadMap() end
+local function loadFolders() return FolderStorage.loadFolders() end
+local function loadFolderOrder() return FolderStorage.loadFolderOrder() end
 local folderOrder = loadFolderOrder()
-local function saveFolderOrder()
-  reaper.SetExtState(SECTION, FOLDER_ORDER_KEY, table.concat(folderOrder, "\n"), true)
-end
+-- Revisions invalidate derived browser data only when folder assignments or
+-- folder definitions actually change, not on every gfx/defer pass.
+local folderDataRevision = 0
+local function saveFolderOrder() FolderStorage.saveFolderOrder(folderOrder); folderDataRevision = folderDataRevision + 1 end
 
 local function saveFolders(set)
-  local list, known = {}, {}
-  for folder in pairs(set) do list[#list + 1] = folder; known[folder] = true end
-  table.sort(list, function(a,b) return a:lower() < b:lower() end)
-  local ordered = {}
-  for _, folder in ipairs(folderOrder) do
-    if known[folder] then ordered[folder] = true end
+  local known, seen, ordered = {}, {}, {}
+  for path in pairs(set or {}) do if path ~= "" then known[path] = true end end
+  for _, path in ipairs(folderOrder or {}) do
+    if known[path] and not seen[path] then ordered[#ordered + 1] = path; seen[path] = true end
   end
   local missing = {}
-  for _, folder in ipairs(list) do if not ordered[folder] then missing[#missing+1] = folder end end
-  for _, folder in ipairs(missing) do folderOrder[#folderOrder+1] = folder end
-  saveFolderOrder()
-  reaper.SetExtState(SECTION, FOLDERS_KEY, table.concat(list, "\n"), true)
+  for path in pairs(known) do if not seen[path] then missing[#missing + 1] = path end end
+  table.sort(missing, function(a, b)
+    local da, db = select(2, a:gsub("/", "")), select(2, b:gsub("/", ""))
+    if da ~= db then return da < db end
+    return a:lower() < b:lower()
+  end)
+  for _, path in ipairs(missing) do ordered[#ordered + 1] = path end
+  folderOrder = FolderStorage.saveFolders(set, ordered)
+  folderDataRevision = folderDataRevision + 1
 end
 
 local function saveMap(map)
-  local keys = {}
-  for k in pairs(map) do keys[#keys + 1] = k end
-  table.sort(keys)
-  local lines = {}
-  for _, k in ipairs(keys) do
-    lines[#lines + 1] = k .. "\t" .. map[k]
-  end
-  reaper.SetExtState(SECTION, KEY, table.concat(lines, "\n"), true)
+  FolderStorage.saveMap(map)
+  folderDataRevision = folderDataRevision + 1
 end
+
+reaper.SetExtState(SECTION, RUN_KEY, "1", false)
+reaper.SetExtState(SECTION, CLOSE_KEY, "", false)
 
 local function getFormat(ident, name)
   -- REAPER identifiers may include instrument suffixes (VSTi/VST3i) or
@@ -108,11 +120,16 @@ local function getFormat(ident, name)
   return "Other"
 end
 
-local function getManufacturer(name, ident)
+local function getManufacturer(name, ident, format)
+  -- JSFX names often contain author/effect annotations in parentheses. Those
+  -- are not reliable vendor metadata, so JSFX are deliberately kept out of
+  -- the automatically generated Manufacturers tree.
+  if format == "JSFX" then return "Other / Unknown" end
+
   local function validVendor(v)
     if not v then return nil end
     v = trim(v):gsub("^%s+", ""):gsub("%s+$", "")
-    if v == "" then return nil end
+    if v == "" or #v < 2 then return nil end
     local low = v:lower():gsub("[%s_]+", " ")
     -- Channel layouts and REAPER's routing/format descriptors are not vendors.
     if low == "other" or low == "unknown" or low == "other / unknown" or low == "crossover" then return nil end
@@ -158,8 +175,9 @@ local function getFX()
     local key = ident ~= "" and ident or name
     if key ~= "" and not seen[key] then
       seen[key] = true
+      local format = getFormat(ident, name)
       fx[#fx + 1] = {name = name, ident = ident, key = key,
-        format = getFormat(ident, name), manufacturer = getManufacturer(name, ident)}
+        format = format, manufacturer = getManufacturer(name, ident, format)}
     end
   end
   table.sort(fx, function(a,b) return a.name:lower() < b.name:lower() end)
@@ -189,6 +207,36 @@ end
 local function hasFolderAssignment(key, wanted)
   for _, path in ipairs(assignedPaths(key)) do if path == wanted then return true end end
   return false
+end
+
+-- Older installations may already have folders but no saved manual-order list.
+-- Seed the order once from existing data so a newly created folder is appended
+-- after the user's current folders instead of being placed first/alphabetically.
+do
+  local known = {}
+  local function addPathAndParents(path)
+    local cur = ""
+    for _, part in ipairs(split(path, "/")) do
+      cur = cur == "" and part or (cur .. "/" .. part)
+      known[cur] = true
+    end
+  end
+  for path in pairs(savedFolders) do addPathAndParents(path) end
+  for key in pairs(folderMap) do
+    for _, path in ipairs(assignedPaths(key)) do addPathAndParents(path) end
+  end
+  local seen = {}
+  for _, path in ipairs(folderOrder) do seen[path] = true end
+  local missing = {}
+  for path in pairs(known) do if not seen[path] then missing[#missing + 1] = path end end
+  table.sort(missing, function(a, b)
+    local da = select(2, a:gsub("/", ""))
+    local db = select(2, b:gsub("/", ""))
+    if da ~= db then return da < db end
+    return a:lower() < b:lower()
+  end)
+  for _, path in ipairs(missing) do folderOrder[#folderOrder + 1] = path end
+  if #missing > 0 then saveFolderOrder() end
 end
 
 local function storeAssignedPaths(key, paths)
@@ -224,12 +272,107 @@ local selectionCleared = false -- distinguishes an intentionally empty selection
 local selectedManufacturer = nil
 local search = ""
 local searchFocused = false
+local searchCursor = 0
+local searchSelStart, searchSelEnd = nil, nil
+local searchMouseSelecting = false
+
+local function searchPositionAtX(mouseX)
+  local relX = math.max(0, mouseX - 22)
+  local pos = #search
+  for i = 1, #search do
+    if gfx.measurestr(search:sub(1, i)) >= relX then
+      pos = i - 1
+      break
+    end
+  end
+  return math.max(0, math.min(#search, pos))
+end
 local cursorVisible = true
 local lastCursorBlink = 0
 local contextMenu = nil
+local FOLDER_COLORS_KEY = "folder_colors_v1"
+-- Legacy named colors remain readable; new selections are stored as exact RGB hex.
+local legacyFolderColors = {
+  red={0.96,0.30,0.32}, orange={1.00,0.55,0.20}, yellow={0.98,0.80,0.25},
+  green={0.34,0.78,0.48}, teal={0.25,0.78,0.76}, blue={0.35,0.62,1.00},
+  purple={0.68,0.48,0.96}, pink={0.98,0.48,0.70}, gray={0.68,0.72,0.77}
+}
+local folderColors = {}
+-- Length-prefixed paths keep arbitrary folder names safe in the sidecar setting.
+do
+  local raw = FolderStorage.getSetting(FOLDER_COLORS_KEY) or ""
+  local pos = 1
+  while pos <= #raw do
+    local colon = raw:find(":", pos, true)
+    if not colon then break end
+    local length = tonumber(raw:sub(pos, colon - 1))
+    if not length or length < 0 then break end
+    local first = colon + 1
+    local last = first + length - 1
+    if last > #raw then break end
+    local path = raw:sub(first, last)
+    local nextSep = raw:find("\n", last + 1, true)
+    local colorId = raw:sub(last + 1, nextSep and nextSep - 1 or #raw)
+    if path ~= "" and colorId ~= "" then folderColors[path] = colorId end
+    if not nextSep then break end
+    pos = nextSep + 1
+  end
+end
+local function saveFolderColors()
+  local paths = {}
+  for path in pairs(folderColors) do paths[#paths+1] = path end
+  table.sort(paths)
+  local parts = {}
+  for _, path in ipairs(paths) do
+    parts[#parts+1] = tostring(#path) .. ":" .. path .. folderColors[path]
+  end
+  FolderStorage.setSetting(FOLDER_COLORS_KEY, table.concat(parts, "\n"))
+end
+local function getFolderColor(path)
+  local value = folderColors[path]
+  if not value then return nil end
+  local rr, gg, bb = tostring(value):match("^#?(%x%x)(%x%x)(%x%x)$")
+  if rr then return tonumber(rr,16)/255, tonumber(gg,16)/255, tonumber(bb,16)/255 end
+  local legacy = legacyFolderColors[value]
+  if legacy then return legacy[1], legacy[2], legacy[3] end
+  return nil
+end
+
+local function chooseFolderColor(path)
+  if not reaper.GR_SelectColor then
+    status = "This REAPER build does not expose its native color picker."
+    return false
+  end
+  local r, g, b = getFolderColor(path)
+  local initial = (r and reaper.ColorToNative(
+    math.floor(r*255+0.5), math.floor(g*255+0.5), math.floor(b*255+0.5))) or 0
+  local ok, nativeColor = reaper.GR_SelectColor(gfx.hwnd or reaper.GetMainHwnd(), initial)
+  if ok then
+    local cr, cg, cb = reaper.ColorFromNative(nativeColor)
+    if cr and cg and cb then
+      folderColors[path] = ("%02X%02X%02X"):format(cr, cg, cb)
+      saveFolderColors()
+      status = "Folder color updated: " .. path
+      return true
+    end
+  end
+  return false
+end
+local function remapFolderColorPaths(source, destination, includeChildren)
+  local remapped = {}
+  for path, id in pairs(folderColors) do
+    if path == source or (includeChildren and path:sub(1, #source + 1) == source .. "/") then
+      remapped[destination .. path:sub(#source + 1)] = id
+    else
+      remapped[path] = id
+    end
+  end
+  folderColors = remapped
+  saveFolderColors()
+end
 local formatMenuOpen = false
 local formatEnabled = {AU=true, VST=true, VST3=true, CLAP=true, JSFX=true, LV2=true, DX=true}
-local rawFormatState = reaper.GetExtState(SECTION, "formats_v1")
+local rawFormatState = FolderStorage.getSetting("formats_v1") or ""
 if rawFormatState ~= "" then
   for _, f in ipairs({"AU","VST","VST3","CLAP","JSFX","LV2","DX"}) do formatEnabled[f] = rawFormatState:find("|" .. f .. "|", 1, true) ~= nil end
 end
@@ -238,7 +381,7 @@ local function saveFormatState()
   for _, f in ipairs({"AU","VST","VST3","CLAP","JSFX","LV2","DX"}) do
     if formatEnabled[f] then parts[#parts+1] = f; parts[#parts+1] = "|" end
   end
-  reaper.SetExtState(SECTION, "formats_v1", table.concat(parts), true)
+  FolderStorage.setSetting("formats_v1", table.concat(parts))
 end
 local expandedFolders = {} -- a parent shows its children only after clicking +
 local pendingFolderReveal = nil
@@ -254,7 +397,7 @@ local draggingFolderScrollbar = false
 -- Restore the browser's working view across close/reopen.
 local UI_STATE_KEY = "ui_state_v1"
 local function restoreUIState()
-  local raw = reaper.GetExtState(SECTION, UI_STATE_KEY)
+  local raw = FolderStorage.getSetting(UI_STATE_KEY) or ""
   if raw == "" then return end
   local values = {}
   for line in (raw .. "\n"):gmatch("(.-)\n") do
@@ -300,10 +443,57 @@ local function saveUIState()
   put("expandedFolders", joinedKeys(expandedFolders))
   put("manufacturersExpanded", manufacturersExpanded and "1" or "0")
   put("expandedManufacturers", joinedKeys(expandedManufacturers))
-  reaper.SetExtState(SECTION, UI_STATE_KEY, table.concat(parts, "\n"), true)
+  FolderStorage.setSetting(UI_STATE_KEY, table.concat(parts, "\n"))
 end
 
 restoreUIState()
+
+-- Lightweight in-memory navigation history for folder/manufacturer views.
+-- It does not alter saved folders, assignments, or REAPER project state.
+local viewHistory, viewHistoryIndex = {}, 0
+local function pushViewHistory()
+  local last = viewHistory[viewHistoryIndex]
+  if last and last.folder == selectedFolder and last.manufacturer == selectedManufacturer then return end
+  for i = #viewHistory, viewHistoryIndex + 1, -1 do viewHistory[i] = nil end
+  viewHistory[#viewHistory + 1] = {
+    folder = selectedFolder, manufacturer = selectedManufacturer,
+    scroll = scroll, selectedFX = selectedFX
+  }
+  viewHistoryIndex = #viewHistory
+  if #viewHistory > 60 then
+    table.remove(viewHistory, 1)
+    viewHistoryIndex = #viewHistory
+  end
+end
+pushViewHistory()
+
+local function setBrowserView(folder, manufacturer)
+  if folder == selectedFolder and manufacturer == selectedManufacturer then return false end
+  local current = viewHistory[viewHistoryIndex]
+  if current then current.scroll, current.selectedFX = scroll, selectedFX end
+  selectedFolder, selectedManufacturer = folder, manufacturer
+  scroll = 0
+  pushViewHistory()
+  return true
+end
+
+local function navigateHistory(direction)
+  local current = viewHistory[viewHistoryIndex]
+  if current then current.scroll, current.selectedFX = scroll, selectedFX end
+  local target = viewHistoryIndex + direction
+  if target < 1 or target > #viewHistory then return false end
+  viewHistoryIndex = target
+  local entry = viewHistory[target]
+  selectedFolder, selectedManufacturer = entry.folder, entry.manufacturer
+  scroll = math.max(0, entry.scroll or 0)
+  selectedFX = math.max(1, entry.selectedFX or 1)
+  searchFocused = false
+  contextMenu = nil
+  status = direction < 0 and "Back: " .. (selectedManufacturer or selectedFolder)
+    or "Forward: " .. (selectedManufacturer or selectedFolder)
+  return true
+end
+
 status = "Loaded " .. #fxList .. " unique entries (deduplicated by identifier)."
 local rows = {}
 local rowHeight = 23
@@ -311,8 +501,17 @@ local listX, listY, listW, listH = 14, 118, 650, 390
 local winW, winH = 900, 570
 local leftW = 210
 local resizingDivider = false
+local aboutOpen = false
+
+local allFoldersCache = nil
+local allFoldersCacheRevision = -1
+local folderChildrenCache = nil
+local folderChildrenCacheRevision = -1
 
 local function allFolders()
+  if allFoldersCache and allFoldersCacheRevision == folderDataRevision then
+    return allFoldersCache
+  end
   local set = {["All FX"] = true, ["Unsorted"] = true}
   for path in pairs(savedFolders) do
     if path ~= "" then
@@ -323,12 +522,17 @@ local function allFolders()
       end
     end
   end
-  for _, path in pairs(folderMap) do
-    if path ~= "" then
-      local cur = ""
-      for _, part in ipairs(split(path, "/")) do
-        cur = cur == "" and part or (cur .. "/" .. part)
-        set[cur] = true
+  -- folderMap values may contain several assignments separated by ASSIGN_SEP.
+  -- Always expand them with assignedPaths(); otherwise the separator can become
+  -- part of a folder name and leave phantom entries that cannot be deleted.
+  for key in pairs(folderMap) do
+    for _, path in ipairs(assignedPaths(key)) do
+      if path ~= "" then
+        local cur = ""
+        for _, part in ipairs(split(path, "/")) do
+          cur = cur == "" and part or (cur .. "/" .. part)
+          set[cur] = true
+        end
       end
     end
   end
@@ -344,6 +548,8 @@ local function allFolders()
     if a == "Unsorted" then return true end
     if b == "Unsorted" then return false end
     local aa, bb = segments(a), segments(b)
+    -- Compare each pair of sibling folders by the saved manual order first.
+    -- Alphabetical order is only a fallback for legacy folders absent from the order list.
     for i = 1, math.min(#aa, #bb) do
       if aa[i] ~= bb[i] then
         local ap = table.concat(aa, "/", 1, i)
@@ -357,15 +563,25 @@ local function allFolders()
     end
     return #aa < #bb
   end)
-  return out
+  allFoldersCache = out
+  allFoldersCacheRevision = folderDataRevision
+  return allFoldersCache
 end
 
 local function hasChildren(path, folders)
-  local prefix = path .. "/"
-  for _, f in ipairs(folders) do
-    if f:sub(1, #prefix) == prefix then return true end
+  if not folderChildrenCache or folderChildrenCacheRevision ~= folderDataRevision then
+    local parents = {}
+    for _, folder in ipairs(folders) do
+      local parent = folder:match("^(.*)/[^/]+$")
+      while parent do
+        parents[parent] = true
+        parent = parent:match("^(.*)/[^/]+$")
+      end
+    end
+    folderChildrenCache = parents
+    folderChildrenCacheRevision = folderDataRevision
   end
-  return false
+  return folderChildrenCache[path] == true
 end
 
 local function visibleFolders(folders)
@@ -495,8 +711,8 @@ local function moveFolderPath(source, target, mode)
     folderOrder = all
   end
   saveFolders(savedFolders); saveMap(folderMap); saveFolderOrder()
-  selectedFolder = newPath
-  selectedManufacturer = nil
+  if newPath ~= source then remapFolderColorPaths(source, newPath, true) end
+  setBrowserView(newPath, nil)
   ensureAncestorsExpanded(newPath)
   expandedFolders[newPath] = true
   pendingFolderReveal = newPath
@@ -506,34 +722,201 @@ end
 
 
 
-local function currentRows()
-  local out = {}
-  local q = search:lower()
-  for _, fx in ipairs(fxList) do
-    local paths = assignedPaths(fx.key)
-    -- Search narrows the current view inside the selected folder.
-    local folderOK = selectedFolder == "All FX"
-      or (selectedFolder == "Unsorted" and #paths == 0)
-      or (selectedFolder ~= "My Folders" and selectedFolder ~= "Unsorted" and selectedFolder ~= "All FX" and hasFolderAssignment(fx.key, selectedFolder))
-    local manufacturerOK = not selectedManufacturer or fx.manufacturer == selectedManufacturer
-    local formatOK = fx.format == "Other" or formatEnabled[fx.format] ~= false
-    local searchOK = q == "" or fx.name:lower():find(q, 1, true) or fx.ident:lower():find(q, 1, true) or fx.manufacturer:lower():find(q, 1, true)
-    if folderOK and manufacturerOK and formatOK and searchOK then out[#out + 1] = fx end
+local function renameSelectedFolder()
+  local source = selectedFolder
+  if not source or source == "All FX" or source == "Unsorted" or source == "My Folders" then
+    status = "Select a custom folder in My Folders to rename it."
+    return false
   end
-  return out
+  local oldName = pathBase(source)
+  local ok, value = reaper.GetUserInputs("Rename folder", 1, "New folder name:", oldName)
+  if not ok then return false end
+  local newName = trim(value or "")
+  if newName == "" or newName:find("/", 1, true) or newName:find("\\", 1, true) then
+    reaper.ShowMessageBox("Enter a folder name without slash characters.", "Nested FX Browser", 0)
+    return false
+  end
+  if newName == oldName then return false end
+  local parent = pathParent(source)
+  local newPath = parent ~= "" and (parent .. "/" .. newName) or newName
+  for _, existing in ipairs(allFolders()) do
+    if existing == newPath or existing:sub(1, #newPath + 1) == newPath .. "/" then
+      status = "A folder with that name already exists."
+      return false
+    end
+  end
+
+  -- Rename only the selected folder path. Do not rename or move child folders.
+  -- Plugin assignments pointing to this exact folder are updated so its plugins stay inside.
+  local remap = function(path)
+    if path == source then return newPath end
+    return path
+  end
+  local renamedFolders = {}
+  for path in pairs(savedFolders) do renamedFolders[remap(path)] = true end
+  savedFolders = renamedFolders
+  for key in pairs(folderMap) do
+    local paths, changed = assignedPaths(key), {}
+    for _, path in ipairs(paths) do changed[#changed + 1] = remap(path) end
+    storeAssignedPaths(key, changed)
+  end
+  local renamedOrder = {}
+  for _, path in ipairs(folderOrder) do renamedOrder[#renamedOrder + 1] = remap(path) end
+  folderOrder = renamedOrder
+  if folderColors[source] then remapFolderColorPaths(source, newPath, false) end
+  local renamedExpanded = {}
+  for path, isExpanded in pairs(expandedFolders) do
+    if isExpanded then renamedExpanded[remap(path)] = true end
+  end
+  expandedFolders = renamedExpanded
+
+  saveFolders(savedFolders)
+  saveMap(folderMap)
+  saveFolderOrder()
+  setBrowserView(newPath, nil)
+  ensureAncestorsExpanded(newPath)
+  expandedFolders[newPath] = true
+  pendingFolderReveal = newPath
+  status = "Renamed folder: " .. source .. " → " .. newPath
+  return true
 end
 
+local function normalizeSearch(s)
+  -- Remove all separators for compact matching: L-1 == L1, Pro - G == Pro-G.
+  return tostring(s or ""):lower():gsub("[%s%p]", "")
+end
+
+local function searchFieldMatches(field, query, compactQuery)
+  if query == "" then return true end
+  local value = tostring(field or ""):lower()
+  if value:find(query, 1, true) then return true end
+  local compactValue = normalizeSearch(value)
+  return compactQuery ~= "" and compactValue:find(compactQuery, 1, true) ~= nil
+end
+
+local function pluginStartsWithSearch(fx, query)
+  local q = normalizeSearch(query)
+  if q == "" then return false end
+  return normalizeSearch(fx.name):sub(1, #q) == q
+      or normalizeSearch(fx.manufacturer):sub(1, #q) == q
+end
+
+local function pluginMatchesSearch(fx, query)
+  if query == "" then return true end
+  -- The search is intentionally limited to plugin display name and manufacturer.
+  -- Check both fields together so "Waves L1" works as well as "L1" or "Waves".
+  local name = tostring(fx.name or ""):lower()
+  local vendor = tostring(fx.manufacturer or ""):lower()
+  local combined = name .. " " .. vendor
+  local compactCombined = normalizeSearch(combined)
+  local compactQuery = normalizeSearch(query)
+
+  -- First try the complete query. This preserves punctuation-aware names such as Pro-G,
+  -- while the compact form also matches when the user types Pro - G or L-1 / L1.
+  if combined:find(query, 1, true) then return true end
+  if compactQuery ~= "" and compactCombined:find(compactQuery, 1, true) then return true end
+
+  -- For multi-word queries, every typed word must match either the name or vendor.
+  -- This avoids returning every "Pro" plugin when the user continues typing "Pro-G".
+  for token in query:lower():gmatch("[^%s]+") do
+    local compactToken = normalizeSearch(token)
+    if compactToken ~= "" then
+      local nameHit = name:find(token, 1, true) ~= nil
+        or normalizeSearch(name):find(compactToken, 1, true) ~= nil
+      local vendorHit = vendor:find(token, 1, true) ~= nil
+        or normalizeSearch(vendor):find(compactToken, 1, true) ~= nil
+      if not nameHit and not vendorHit then return false end
+    end
+  end
+  return true
+end
+
+local currentRowsCache = nil
+local currentRowsCacheKey = nil
+local function currentRows()
+  local formatKey = table.concat({
+    formatEnabled.AU and "1" or "0",
+    formatEnabled.VST and "1" or "0",
+    formatEnabled.VST3 and "1" or "0",
+    formatEnabled.CLAP and "1" or "0",
+    formatEnabled.JSFX and "1" or "0",
+    formatEnabled.LV2 and "1" or "0",
+    formatEnabled.DX and "1" or "0"
+  })
+  local cacheKey = table.concat({search, selectedFolder, selectedManufacturer or "", formatKey, tostring(folderDataRevision)}, string.char(31))
+  if currentRowsCache and currentRowsCacheKey == cacheKey then
+    return currentRowsCache
+  end
+  local out, candidates = {}, {}
+  local q = search:lower()
+  local selectedVendor = normalizeSearch(selectedManufacturer)
+  for _, fx in ipairs(fxList) do
+    local paths = assignedPaths(fx.key)
+    local folderOK = selectedFolder == "All FX"
+      or (selectedFolder == "Unsorted" and #paths == 0)
+    if selectedFolder == "My Folders" then
+      -- The My Folders root shows every assigned plugin, including those in subfolders.
+      folderOK = #paths > 0
+    elseif selectedFolder ~= "All FX" and selectedFolder ~= "Unsorted" then
+      -- A folder displays only plugins assigned directly to that exact folder.
+      -- Child-folder plugins appear only when the child folder is selected.
+      for _, path in ipairs(paths) do
+        if path == selectedFolder then
+          folderOK = true
+          break
+        end
+      end
+    end
+    local fxVendor = normalizeSearch(fx.manufacturer)
+    -- Manufacturer views are exact groups. Substring matching made short
+    -- names (for example "R") pull unrelated vendors into the same group.
+    local manufacturerOK = not selectedManufacturer or fxVendor == selectedVendor
+    local formatOK = fx.format == "Other" or formatEnabled[fx.format] ~= false
+    if folderOK and manufacturerOK and formatOK then candidates[#candidates + 1] = fx end
+  end
+
+  -- While typing a single word, prefer names that START with it, so the list
+  -- behaves like live suggestions. If no prefix exists, fall back to substring
+  -- matching (needed for names such as "FabFilter Pro-G"). Multiword searches
+  -- always use the normal name/manufacturer matcher (e.g. "Waves L1").
+  local trimmed = q:match("^%s*(.-)%s*$") or q
+  local usePrefix = trimmed ~= "" and not trimmed:find("%s")
+  if usePrefix then
+    local hasPrefix = false
+    for _, fx in ipairs(candidates) do
+      if pluginStartsWithSearch(fx, trimmed) then hasPrefix = true; break end
+    end
+    if hasPrefix then
+      for _, fx in ipairs(candidates) do
+        if pluginStartsWithSearch(fx, trimmed) then out[#out + 1] = fx end
+      end
+      currentRowsCache, currentRowsCacheKey = out, cacheKey
+      return currentRowsCache
+    end
+  end
+  for _, fx in ipairs(candidates) do
+    if pluginMatchesSearch(fx, q) then out[#out + 1] = fx end
+  end
+  currentRowsCache, currentRowsCacheKey = out, cacheKey
+  return currentRowsCache
+end
+
+local manufacturersCache = nil
 local function getManufacturers()
+  if manufacturersCache then return manufacturersCache end
   local set, out = {}, {}
   for _, fx in ipairs(fxList) do if fx.manufacturer ~= "Other / Unknown" then set[fx.manufacturer] = true end end
   for name in pairs(set) do out[#out+1] = name end
   table.sort(out, function(a,b) return a:lower() < b:lower() end)
-  return out
+  manufacturersCache = out
+  return manufacturersCache
 end
 
 local THEME_KEY = "color_theme_v1"
-local themeNames = {"REAPER", "Dark", "Graphite", "Light", "Warm Light"}
-local currentTheme = reaper.GetExtState(SECTION, THEME_KEY)
+local themeNames = {"REAPER", "Dark", "Graphite", "Light", "Warm Light", "Forest", "Burgundy", "Brown"}
+local currentTheme = FolderStorage.getSetting(THEME_KEY) or ""
+local FONT_SIZE_KEY = "font_size_v1"
+local fontSize = math.max(11, math.min(22, tonumber(FolderStorage.getSetting(FONT_SIZE_KEY)) or 15))
 local validTheme = false
 for _, name in ipairs(themeNames) do if currentTheme == name then validTheme = true; break end end
 if not validTheme then currentTheme = "Dark" end
@@ -589,6 +972,16 @@ local function color(r,g,b,a)
     r, g, b = math.min(1,r*0.96+0.04), math.min(1,g*0.95+0.035), math.min(1,b*0.88+0.03)
   elseif currentTheme == "Graphite" then
     r, g, b = r*0.88+0.035, g*0.90+0.035, b*0.94+0.035
+  elseif currentTheme == "Forest" or currentTheme == "Burgundy" or currentTheme == "Brown" then
+    -- Muted dark tints: darker UI elements receive more color; bright text
+    -- receives only a trace, keeping labels readable.
+    local tr, tg, tb
+    if currentTheme == "Forest" then tr, tg, tb = 0.045, 0.145, 0.085
+    elseif currentTheme == "Burgundy" then tr, tg, tb = 0.155, 0.045, 0.075
+    else tr, tg, tb = 0.16, 0.105, 0.065 end
+    local lum = (r + g + b) / 3
+    local amount = lum > 0.78 and 0.025 or (lum > 0.48 and 0.10 or 0.24)
+    r, g, b = mix(r, tr, amount), mix(g, tg, amount), mix(b, tb, amount)
   end
   gfx.set(math.max(0,math.min(1,r)), math.max(0,math.min(1,g)), math.max(0,math.min(1,b)), a or 1)
 end
@@ -611,6 +1004,23 @@ local function fitText(x, y, value, maxWidth, r, g, b)
     s = best ~= "" and best or "..."
   end
   text(x, y, s, r, g, b)
+end
+local function fitFolderText(x, y, value, maxWidth, r, g, b)
+  local s = tostring(value or "")
+  maxWidth = math.max(8, maxWidth or 8)
+  if gfx.measurestr(s) > maxWidth then
+    local suffix = "..."
+    local lo, hi, best = 0, #s, ""
+    while lo <= hi do
+      local mid = math.floor((lo + hi) / 2)
+      local candidate = s:sub(1, mid) .. suffix
+      if gfx.measurestr(candidate) <= maxWidth then best = candidate; lo = mid + 1 else hi = mid - 1 end
+    end
+    s = best ~= "" and best or "..."
+  end
+  gfx.set(math.max(0,math.min(1,r or 0.88)), math.max(0,math.min(1,g or 0.90)), math.max(0,math.min(1,b or 0.92)), 1)
+  gfx.x, gfx.y = x, y
+  gfx.drawstr(s)
 end
 local function button(x,y,w,h,label)
   local mx,my = gfx.mouse_x,gfx.mouse_y
@@ -639,9 +1049,13 @@ end
 
 local function addFX(fx)
   if not fx then status = "Select a plugin first."; return false end
-  local track = reaper.GetSelectedTrack(0, 0)
+  -- GetSelectedTrack() ignores the master track. GetSelectedTrack2() with
+  -- wantmaster=true includes it, while preserving the normal selected-track
+  -- behavior for ordinary tracks.
+  local track = reaper.GetSelectedTrack2 and reaper.GetSelectedTrack2(0, 0, true)
+  if not track then track = reaper.GetSelectedTrack(0, 0) end
   if not track then
-    reaper.ShowMessageBox("Select a track in the REAPER arrange view first.", "Nested FX Browser", 0)
+    reaper.ShowMessageBox("Select a track (including the Master Track) in REAPER first.", "Nested FX Browser", 0)
     return false
   end
   local candidates = {}
@@ -665,6 +1079,8 @@ local function addFX(fx)
   return false
 end
 
+local closeAfterAdd = false
+
 local function addSelected()
   local visible = currentRows()
   local targets = {}
@@ -676,6 +1092,9 @@ local function addSelected()
   local added = 0
   for _, fx in ipairs(targets) do if addFX(fx) then added = added + 1 end end
   if #targets > 1 then status = ("Added %d of %d selected plugins."):format(added, #targets) end
+  -- Match REAPER's native FX browser: close only after at least one plugin
+  -- was successfully inserted. Failed additions leave the browser available.
+  if added > 0 then closeAfterAdd = true end
 end
 
 local function clearSelectionExcept(key)
@@ -757,10 +1176,21 @@ local function createFolderFromInput(value)
     cur = cur == "" and part or (cur .. "/" .. part)
     savedFolders[cur] = true
   end
+  -- Append newly created path components BEFORE saving. This prevents the
+  -- storage helper from appending them in alphabetical order during the save.
+  local ordered = {}
+  for _, existing in ipairs(folderOrder) do ordered[existing] = true end
+  cur = ""
+  for _, part in ipairs(split(path, "/")) do
+    cur = cur == "" and part or (cur .. "/" .. part)
+    if not ordered[cur] then
+      folderOrder[#folderOrder + 1] = cur
+      ordered[cur] = true
+    end
+  end
   saveFolders(savedFolders)
   -- Select the new folder and reveal it in place; never reset the tree to row 1.
-  selectedFolder = path
-  selectedManufacturer = nil
+  setBrowserView(path, nil)
   ensureAncestorsExpanded(path)
   expandedFolders[path] = true
   pendingFolderReveal = path
@@ -784,7 +1214,47 @@ local function removeFromFolder(fx)
   status = "Removed from folder " .. removePath .. ": " .. fx.name
 end
 
+local function removeSelectedFromFolder(fallbackFX)
+  local visible = currentRows()
+  local targets = {}
+  for _, fx in ipairs(visible) do
+    if selectedFXKeys[fx.key] then targets[#targets + 1] = fx end
+  end
+  if #targets == 0 and fallbackFX then targets[1] = fallbackFX end
+  if #targets == 0 then status = "Select one or more plugins first."; return end
+
+  local removed, skipped = 0, 0
+  local removedFolder = nil
+  for _, fx in ipairs(targets) do
+    local paths = assignedPaths(fx.key)
+    if #paths == 0 then
+      skipped = skipped + 1
+    else
+      local removePath = hasFolderAssignment(fx.key, selectedFolder) and selectedFolder or paths[1]
+      local kept = {}
+      for _, path in ipairs(paths) do
+        if path ~= removePath then kept[#kept + 1] = path end
+      end
+      storeAssignedPaths(fx.key, kept)
+      removed = removed + 1
+      removedFolder = removedFolder or removePath
+    end
+  end
+  if removed > 0 then saveMap(folderMap) end
+  if #targets == 1 and removed == 1 then
+    status = "Removed from folder " .. tostring(removedFolder) .. ": " .. targets[1].name
+  else
+    status = ("Removed %d selected plugin(s) from folders."):format(removed)
+    if skipped > 0 then status = status .. (" %d had no folder assignment."):format(skipped) end
+  end
+  clearSelectionExcept(nil)
+end
+
 local function draw()
+  -- Keep interface controls and labels at a fixed size; fontSize is only for
+  -- the folder tree and plugin names.
+  gfx.setfont(1, "Arial", 15)
+  rowHeight = fontSize + 8
   winW, winH = gfx.w, gfx.h
   leftW = math.max(150, math.min(leftW, winW - 420))
   listW = math.max(300, winW - leftW - 38)
@@ -793,17 +1263,34 @@ local function draw()
   local rightX = 24 + leftW
   local dividerX = 18 + leftW
   color(0.105,0.115,0.13,1); gfx.rect(0,0,winW,winH,1)
-  text(14,10,"REAPER NESTED FX BROWSER",1,0.86,0.48)
+  button(14,8,30,24,"<")
+  button(48,8,30,24,">")
+  text(88,10,"VSOUND",1,0.66,0.30)
+  text(160,10,"REAPER NESTED FX BROWSER",1,0.86,0.48)
   text(14,34,"Read-only inventory; folder assignments are saved separately. No network/rescan functions.",0.72,0.77,0.80)
+  button(winW-210,8,36,24,"A−")
+  button(winW-170,8,36,24,"A+")
   button(winW-124,8,110,24,"Color: " .. currentTheme)
 
   -- Search and compact format menu in the top bar.
   local searchW = math.max(150, winW - 700)
   color(0.07,0.08,0.09,1); gfx.rect(14,58,searchW,28,1)
   color(searchFocused and 0.70 or 0.35, searchFocused and 0.62 or 0.38, searchFocused and 0.30 or 0.40,1); gfx.rect(14,58,searchW,28,0)
-  text(22,64,(search == "" and not searchFocused) and "Search..." or search, (search == "" and not searchFocused) and 0.55 or 0.96, (search == "" and not searchFocused) and 0.58 or 0.96, (search == "" and not searchFocused) and 0.60 or 0.96)
+  if search == "" and not searchFocused then
+    text(22,64,"Search...",0.55,0.58,0.60)
+  else
+    local a, b = searchSelStart, searchSelEnd
+    if a and b and a ~= b then
+      if a > b then a,b = b,a end
+      local leftText, selectedText = search:sub(1,a), search:sub(a+1,b)
+      local sx = 22 + gfx.measurestr(leftText)
+      local sw = gfx.measurestr(selectedText)
+      color(0.22,0.36,0.55,1); gfx.rect(sx,61,sw,20,1)
+    end
+    text(22,64,search,0.96,0.96,0.96)
+  end
   if searchFocused and cursorVisible then
-    local cx = 22 + gfx.measurestr(search)
+    local cx = 22 + gfx.measurestr(search:sub(1,searchCursor))
     local fieldRight = 14 + searchW - 5
     if cx > fieldRight then cx = fieldRight end
     color(0.98,0.88,0.48,1); gfx.rect(cx,62,2,19,1)
@@ -814,7 +1301,8 @@ local function draw()
   button(winW-212,58,96,28,"Delete Folder")
   button(winW-110,58,96,28,"Create")
 
-  text(14,94,"Library",0.72,0.80,0.88)
+  button(14,90,58,22,"Fold all")
+  button(76,90,82,22,"Rename")
   text(rightX+7,94,"Plugins",0.72,0.80,0.88)
   color(0.07,0.08,0.09,1); gfx.rect(14,114,leftW,listH+4,1); gfx.rect(rightX,114,winW-rightX-14,listH+4,1)
   color(0.27,0.30,0.32,1); gfx.rect(14,114,leftW,listH+4,0); gfx.rect(rightX,114,winW-rightX-14,listH+4,0)
@@ -850,7 +1338,7 @@ local function draw()
       end
     end
   end
-  local folderRowH = 22
+  local folderRowH = fontSize + 7
   local folderViewH = listH
   local maxFolderRows = math.max(1, math.floor((folderViewH - 12) / folderRowH))
   if pendingFolderReveal then
@@ -870,6 +1358,7 @@ local function draw()
   folderScroll = math.max(0, math.min(folderScroll, maxFolderScroll))
   local fy = 122
   if gfx.setclip then gfx.setclip(14,114,leftW,listH+4) end
+  gfx.setfont(1, "Arial", fontSize)
   for fi = folderScroll + 1, math.min(#treeRows, folderScroll + maxFolderRows) do
     local item = treeRows[fi]
     local depth = item.depth or 0
@@ -878,27 +1367,43 @@ local function draw()
       or (item.kind == "customHeader" and selectedFolder == "My Folders" and not selectedManufacturer)
       or (item.kind == "manufacturer" and item.value == selectedManufacturer)
      
-    if isSelected then color(0.22,0.31,0.38,1); gfx.rect(18,fy-2,leftW-4,20,1) end
+    if isSelected then color(0.22,0.31,0.38,1); gfx.rect(18,fy-2,leftW-4,folderRowH-2,1) end
     if item.kind == "manufacturerHeader" then
       text(21,fy,manufacturersExpanded and "−" or "+",0.96,0.82,0.42)
       text(39,fy,item.label,0.96,0.88,0.68)
-      rows[#rows+1] = {kind="manufacturerHeader", value=item.value, x=18, y=fy-2, w=leftW-34, h=20}
+      rows[#rows+1] = {kind="manufacturerHeader", value=item.value, x=18, y=fy-2, w=leftW-34, h=folderRowH-2}
     elseif item.kind == "customHeader" then
       text(21,fy,"▾",0.96,0.82,0.42); text(39,fy,item.label,0.96,0.88,0.68)
-      rows[#rows+1] = {kind="customHeader", value=item.value, x=18, y=fy-2, w=leftW-34, h=20}
+      rows[#rows+1] = {kind="customHeader", value=item.value, x=18, y=fy-2, w=leftW-34, h=folderRowH-2}
     elseif item.kind == "manufacturer" then
       fitText(39+indent,fy,item.label,leftW-(39+indent)-12,selectedManufacturer == item.value and 1 or 0.82,0.86,0.90)
-      rows[#rows+1] = {kind="manufacturer", value=item.value, x=18+indent, y=fy-2, w=leftW-35-indent, h=20}
+      rows[#rows+1] = {kind="manufacturer", value=item.value, x=18+indent, y=fy-2, w=leftW-35-indent, h=folderRowH-2}
     elseif item.kind == "folder" then
       if item.hasKids then
         text(21+indent,fy,expandedFolders[item.value] and "−" or "+",0.96,0.82,0.42)
-        rows[#rows+1] = {kind="toggleFolder", value=item.value, x=18+indent, y=fy-2, w=16, h=20}
+        rows[#rows+1] = {kind="toggleFolder", value=item.value, x=18+indent, y=fy-2, w=16, h=folderRowH-2}
       end
-      fitText(39+indent,fy,item.label,leftW-(39+indent)-12, item.value == selectedFolder and not selectedManufacturer and 1 or 0.82, item.value == selectedFolder and not selectedManufacturer and 0.91 or 0.85, item.value == selectedFolder and not selectedManufacturer and 0.55 or 0.88)
-      rows[#rows+1] = {kind="folder", value=item.value, x=18+indent, y=fy-2, w=leftW-35-indent, h=20}
+      local folderR, folderG, folderB = getFolderColor(item.value)
+      local colorCX, colorCY = 43+indent, fy+7
+      -- A small circular swatch is always visible; click it to open REAPER's
+      -- native full color chooser. The folder label itself keeps its own color.
+      color(0.05,0.06,0.07,1); gfx.circle(colorCX,colorCY,6,true,true)
+      if folderR then
+        gfx.set(folderR,folderG,folderB,1); gfx.circle(colorCX,colorCY,4.5,true,true)
+      else
+        color(0.48,0.52,0.56,1); gfx.circle(colorCX,colorCY,4.5,false,true)
+      end
+      local labelX = 56+indent
+      if folderR then
+        fitFolderText(labelX,fy,item.label,leftW-labelX-12,folderR,folderG,folderB)
+      else
+        fitText(labelX,fy,item.label,leftW-labelX-12, item.value == selectedFolder and not selectedManufacturer and 1 or 0.82, item.value == selectedFolder and not selectedManufacturer and 0.91 or 0.85, item.value == selectedFolder and not selectedManufacturer and 0.55 or 0.88)
+      end
+      rows[#rows+1] = {kind="folder", value=item.value, colorX=colorCX, x=18+indent, y=fy-2, w=leftW-35-indent, h=20}
     end
-    fy = fy + 22
+    fy = fy + folderRowH
   end
+  gfx.setfont(1, "Arial", 15)
   if gfx.setclip then gfx.setclip(0,0,winW,winH) end
 
   -- Independent visible, draggable scrollbar for the left Manufacturers/My Folders tree.
@@ -914,12 +1419,29 @@ local function draw()
   rows[#rows+1] = {kind="folderScrollbar", value={x=treeSBX,y=treeSBY,w=treeSBW,h=treeSBH,thumbY=treeThumbY,thumbH=treeThumbH,maxScroll=treeMaxScroll}, x=treeSBX-2,y=treeSBY,w=treeSBW+4,h=treeSBH}
 
   if draggingFolder and dragFolder then
+    -- Show a real insertion marker while reordering folders. A drop in the
+    -- centre/right of a folder nests; a drop above/below a row reorders siblings.
+    local nearestFolder, nearestDistance = nil, math.huge
     for _, row in ipairs(rows) do
       if row.kind == "folder" and row.value ~= "All FX" and row.value ~= "Unsorted"
-        and gfx.mouse_x >= row.x and gfx.mouse_x <= row.x+row.w and gfx.mouse_y >= row.y and gfx.mouse_y <= row.y+row.h then
-        color(0.58,0.40,0.14,0.85); gfx.rect(row.x,row.y,row.w,row.h,1)
-        color(1,0.88,0.56,1); gfx.rect(row.x,row.y,row.w,row.h,0)
+        and gfx.mouse_x >= 14 and gfx.mouse_x <= 14 + leftW - 14
+        and gfx.mouse_y >= 120 and gfx.mouse_y <= 120 + listH then
+        local centerY = row.y + row.h / 2
+        local distance = math.abs(gfx.mouse_y - centerY)
+        if distance < nearestDistance then nearestFolder, nearestDistance = row, distance end
+        if gfx.mouse_y >= row.y and gfx.mouse_y <= row.y + row.h
+          and gfx.mouse_y >= row.y + row.h * 0.30 and gfx.mouse_y <= row.y + row.h * 0.70 then
+          color(0.58,0.40,0.14,0.85); gfx.rect(row.x,row.y,row.w,row.h,1)
+          color(1,0.88,0.56,1); gfx.rect(row.x,row.y,row.w,row.h,0)
+        end
       end
+    end
+    if nearestFolder and not (gfx.mouse_y >= nearestFolder.y + nearestFolder.h * 0.30
+      and gfx.mouse_y <= nearestFolder.y + nearestFolder.h * 0.70
+      and gfx.mouse_y >= nearestFolder.y and gfx.mouse_y <= nearestFolder.y + nearestFolder.h) then
+      local insertY = gfx.mouse_y < nearestFolder.y + nearestFolder.h / 2 and nearestFolder.y or (nearestFolder.y + nearestFolder.h)
+      color(1,0.78,0.20,1); gfx.rect(20, insertY - 2, leftW - 36, 4, 1)
+      color(1,0.94,0.64,1); gfx.rect(20, insertY - 1, leftW - 36, 1, 1)
     end
     color(1,0.82,0.40,1)
     text(math.min(gfx.mouse_x+12,winW-240), math.max(96,math.min(gfx.mouse_y+10,winH-35)), "↳ Folder: " .. pathBase(dragFolder))
@@ -961,7 +1483,9 @@ local function draw()
     local isSelected = selectedFXKeys[fx.key] or (not selectionCleared and next(selectedFXKeys) == nil and pluginIndex == selectedFX)
     if isSelected then color(0.22,0.31,0.38,1); gfx.rect(rightX+4,y-2,winW-rightX-22,rowHeight,1) end
     if gfx.setclip then gfx.setclip(rightX+8,y-2,math.max(40,winW-rightX-20),rowHeight) end
+    gfx.setfont(1, "Arial", fontSize)
     fitText(rightX+10,y,fx.name,math.max(40, math.floor((winW-rightX)*0.55)-14), isSelected and 1 or 0.88, isSelected and 0.91 or 0.89, isSelected and 0.58 or 0.90)
+    gfx.setfont(1, "Arial", 15)
     if gfx.setclip then gfx.setclip(0,0,winW,winH) end
     local fmtX = rightX + math.floor((winW-rightX)*0.57)
     text(fmtX,y,fx.format,0.55,0.65,0.72)
@@ -986,7 +1510,9 @@ local function draw()
   if contextMenu then
     color(0.12,0.13,0.15,1); gfx.rect(contextMenu.x,contextMenu.y,190,50,1)
     color(0.50,0.53,0.56,1); gfx.rect(contextMenu.x,contextMenu.y,190,50,0)
-    text(contextMenu.x+8,contextMenu.y+7,"Remove from folder",0.95,0.95,0.95)
+    local removeLabel = (contextMenu.selectedCount or 1) > 1
+      and ("Remove " .. contextMenu.selectedCount .. " selected plugins") or "Remove from folder"
+    text(contextMenu.x+8,contextMenu.y+7,removeLabel,0.95,0.95,0.95)
     text(contextMenu.x+8,contextMenu.y+29,"Move to folder...",0.95,0.95,0.95)
   end
 
@@ -1006,7 +1532,7 @@ local function draw()
   end
 
   if themeMenuOpen then
-    local tmX, tmY, tmW, tmH = winW-180, 35, 166, 135
+    local tmX, tmY, tmW, tmH = winW-180, 35, 166, (#themeNames * 25 + 10)
     color(0.09,0.10,0.12,1); gfx.rect(tmX,tmY,tmW,tmH,1)
     color(0.50,0.53,0.56,1); gfx.rect(tmX,tmY,tmW,tmH,0)
     for i, name in ipairs(themeNames) do
@@ -1019,23 +1545,44 @@ local function draw()
     end
   end
 
-  -- Visible splitter handle: drag left/right to resize the manufacturer/folder column.
-  color(0.48,0.52,0.55,1); gfx.rect(dividerX,114,4,listH+4,1)
+  -- The divider is visual only. Resize exclusively with the three-dot grip at its bottom.
+  color(0.40,0.43,0.46,1); gfx.rect(dividerX,114,4,listH+4,1)
+  local gripX, gripY = dividerX + 2, winH - 94
+  color(0.78,0.81,0.83,1)
+  gfx.circle(gripX, gripY - 6, 1.7, true, true)
+  gfx.circle(gripX, gripY,     1.7, true, true)
+  gfx.circle(gripX, gripY + 6, 1.7, true, true)
 
-  color(0.07,0.08,0.09,1); gfx.rect(14,winH-50,winW-28,28,1)
-  text(20,winH-43,status,0.72,0.86,0.78)
-  text(14,winH-22,"Double-click: add selected plugins. Ctrl/Command-click: multi-select. Drag selected plugins to a folder. Drag divider to resize left pane.",0.62,0.69,0.72)
+  color(0.07,0.08,0.09,1); gfx.rect(14,winH-78,winW-28,28,1)
+  text(20,winH-71,status,0.72,0.86,0.78)
+  color(0.085,0.095,0.11,1); gfx.rect(0,winH-44,winW,44,1)
+  button(winW-92,winH-36,78,25,"About")
+
+  if aboutOpen then
+    local ax, ay, aw, ah = winW-310, winH-166, 296, 112
+    color(0.055,0.065,0.078,1); gfx.rect(ax,ay,aw,ah,1)
+    color(0.58,0.63,0.67,1); gfx.rect(ax,ay,aw,ah,0)
+    text(ax+14,ay+12,"ABOUT THIS BROWSER",0.98,0.82,0.43)
+    text(ax+14,ay+39,"Developer: Vassiliy Solovar",0.94,0.95,0.96)
+    text(ax+14,ay+67,"YouTube: @v-sound",0.56,0.78,1.00)
+    color(0.56,0.78,1.00,1); gfx.line(ax+14,ay+84,ax+128,ay+84)
+    text(ax+14,ay+91,"Click the link to open the channel",0.62,0.67,0.71)
+  end
 end
 
 local mouseWasDown = false
 local rightMouseWasDown = false
 local clickTime, clickX, clickY = 0, -100, -100
+-- Keep input polling responsive, but cap full redraws at 20 fps. This avoids
+-- spending REAPER's main-thread time repainting an unchanged browser window.
+local lastDrawTime = 0
+local drawInterval = 1 / 20
 local function saveGeometry()
   local ok, dockState, x, y, w, h = pcall(gfx.dock, -1)
   if ok and type(w) == "number" and type(h) == "number" and w >= 300 and h >= 200 then
-    reaper.SetExtState(SECTION, GEOMETRY_KEY, table.concat({math.floor(w), math.floor(h), math.floor(x or 0), math.floor(y or 0), math.floor(dockState or 0), math.floor(leftW or 210)}, "|"), true)
+    FolderStorage.setSetting("window_geometry_v1", table.concat({math.floor(w), math.floor(h), math.floor(x or 0), math.floor(y or 0), math.floor(dockState or 0), math.floor(leftW or 210)}, "|"))
   else
-    reaper.SetExtState(SECTION, GEOMETRY_KEY, table.concat({math.floor(gfx.w or winW), math.floor(gfx.h or winH), 0, 0, 0, math.floor(leftW or 210)}, "|"), true)
+    FolderStorage.setSetting("window_geometry_v1", table.concat({math.floor(gfx.w or winW), math.floor(gfx.h or winH), 0, 0, 0, math.floor(leftW or 210)}, "|"))
   end
 end
 
@@ -1061,13 +1608,27 @@ local function loop()
 
   local now = reaper.time_precise()
   if now - lastCursorBlink >= 0.5 then cursorVisible = not cursorVisible; lastCursorBlink = now end
-  rows = {}
-  dragTarget = nil
-  draw()
+  local redraw = (now - lastDrawTime) >= drawInterval
+  if redraw then
+    rows = {}
+    dragTarget = nil
+    draw()
+    lastDrawTime = now
+  end
 
   local cap = gfx.mouse_cap
   local down = (cap & 1) == 1
   if down and not mouseWasDown then
+    local searchW = math.max(150, winW - 700)
+    if gfx.mouse_y >= 58 and gfx.mouse_y <= 86 and gfx.mouse_x >= 14 and gfx.mouse_x <= 14 + searchW then
+      searchFocused = true
+      local pos = searchPositionAtX(gfx.mouse_x)
+      searchCursor = pos
+      searchSelStart, searchSelEnd = pos, pos
+      searchMouseSelecting = true
+      cursorVisible = true
+      lastCursorBlink = reaper.time_precise()
+    end
     for _, row in ipairs(rows) do
       if (row.kind == "listScrollbar" or row.kind == "folderScrollbar") and gfx.mouse_x >= row.x and gfx.mouse_x <= row.x+row.w and gfx.mouse_y >= row.y and gfx.mouse_y <= row.y+row.h then
         local info = row.value
@@ -1098,11 +1659,15 @@ local function loop()
     draggingListScrollbar = false
     draggingFolderScrollbar = false
   end
-  if down and not mouseWasDown and math.abs(gfx.mouse_x - (18 + leftW)) <= 7 and gfx.mouse_y >= 114 and gfx.mouse_y <= 114 + listH + 4 then
+  local gripCenterX = 18 + leftW + 2
+  if down and not mouseWasDown
+    and math.abs(gfx.mouse_x - gripCenterX) <= 8
+    and gfx.mouse_y >= winH - 106 and gfx.mouse_y <= winH - 80 then
     resizingDivider = true
+    aboutOpen = false
   end
   if down and resizingDivider then
-    leftW = math.max(150, math.min(winW - 420, gfx.mouse_x - 18))
+    leftW = math.max(150, math.min(winW - 420, gfx.mouse_x - 20))
   elseif not down and mouseWasDown and resizingDivider then
     resizingDivider = false
   end
@@ -1110,14 +1675,50 @@ local function loop()
     local mx,my = gfx.mouse_x,gfx.mouse_y
     dragFX, dragging, dragStartX, dragStartY = nil, false, mx, my
     dragFolder, draggingFolder = nil, false
-    if themeMenuOpen then
+    if my >= winH-38 and my <= winH-8 and mx >= winW-96 and mx <= winW-12 then
+      aboutOpen = not aboutOpen
+      searchFocused = false
+      contextMenu = nil
+      themeMenuOpen = false
+      formatMenuOpen = false
+    elseif aboutOpen then
+      local ax, ay, aw, ah = winW-310, winH-166, 296, 112
+      if mx >= ax+8 and mx <= ax+aw-8 and my >= ay+58 and my <= ay+88 then
+        local url = "https://www.youtube.com/@v-sound"
+        if reaper.CF_ShellExecute then
+          reaper.CF_ShellExecute(url)
+        else
+          local osname = reaper.GetOS and reaper.GetOS() or ""
+          if osname:find("Win", 1, true) then
+            reaper.ExecProcess('cmd /c start "" "' .. url .. '"', 0)
+          elseif osname:find("OSX", 1, true) or osname:find("macOS", 1, true) then
+            reaper.ExecProcess('open "' .. url .. '"', 0)
+          else
+            reaper.ExecProcess('xdg-open "' .. url .. '"', 0)
+          end
+        end
+      end
+      aboutOpen = false
+    elseif my >= 8 and my <= 32 and mx >= 14 and mx <= 44 then
+      navigateHistory(-1)
+    elseif my >= 8 and my <= 32 and mx >= 48 and mx <= 78 then
+      navigateHistory(1)
+    elseif my >= 8 and my <= 32 and mx >= winW-210 and mx <= winW-174 then
+      fontSize = math.max(11, fontSize - 1)
+      FolderStorage.setSetting(FONT_SIZE_KEY, tostring(fontSize))
+      status = "Font size: " .. fontSize
+    elseif my >= 8 and my <= 32 and mx >= winW-170 and mx <= winW-134 then
+      fontSize = math.min(22, fontSize + 1)
+      FolderStorage.setSetting(FONT_SIZE_KEY, tostring(fontSize))
+      status = "Font size: " .. fontSize
+    elseif themeMenuOpen then
       local themeHit = nil
       for _, row in ipairs(rows) do
         if row.kind == "themeChoice" and mx >= row.x and mx <= row.x+row.w and my >= row.y and my <= row.y+row.h then themeHit = row.value; break end
       end
       if themeHit then
         currentTheme = themeHit
-        reaper.SetExtState(SECTION, THEME_KEY, currentTheme, true)
+        FolderStorage.setSetting(THEME_KEY, currentTheme)
         status = "Color theme: " .. currentTheme
       end
       themeMenuOpen = false
@@ -1125,7 +1726,7 @@ local function loop()
       if mx >= contextMenu.x and mx <= contextMenu.x+190 and my >= contextMenu.y and my <= contextMenu.y+50 then
         local fx = contextMenu.fx
         if my < contextMenu.y+25 then
-          removeFromFolder(fx)
+          removeSelectedFromFolder(fx)
         else
           local paths = assignedPaths(fx.key)
           local current = hasFolderAssignment(fx.key, selectedFolder) and selectedFolder or (paths[1] or "")
@@ -1139,6 +1740,15 @@ local function loop()
       local formats = {"AU","VST","VST3","CLAP","JSFX","LV2","DX"}
       local fmt = formats[index]
       if fmt then formatEnabled[fmt] = not formatEnabled[fmt]; saveFormatState(); status = fmt .. (formatEnabled[fmt] and " shown" or " hidden") end
+    elseif my >= 90 and my <= 112 and mx >= 14 and mx <= 72 then
+      searchFocused = false
+      expandedFolders = {}
+      folderScroll = 0
+      pendingFolderReveal = nil
+      status = "All subfolders collapsed."
+    elseif my >= 90 and my <= 112 and mx >= 76 and mx <= 158 then
+      searchFocused = false
+      renameSelectedFolder()
     elseif my >= 8 and my <= 32 and mx >= winW-124 and mx <= winW-14 then
       themeMenuOpen = not themeMenuOpen
       formatMenuOpen = false
@@ -1146,10 +1756,11 @@ local function loop()
     elseif my >= 58 and my <= 86 and mx >= winW-486 and mx <= winW-396 then
       formatMenuOpen = not formatMenuOpen; searchFocused = false
     elseif my >= 58 and my <= 86 and mx >= 14 and mx <= 14+math.max(150,winW-700) then
+      -- Search focus and mouse selection are started in the initial mouse-down
+      -- handler above; do not start a second selection on the same click.
       searchFocused = true
-      cursorVisible = true; lastCursorBlink = reaper.time_precise()
     elseif my >= 58 and my <= 86 and mx >= winW-390 and mx <= winW-320 then
-      search = ""; searchFocused = true; status = "Search cleared."
+      search = ""; searchCursor = 0; searchSelStart, searchSelEnd = nil, nil; searchFocused = true; status = "Search cleared."
     elseif my >= 58 and my <= 86 and mx >= winW-314 and mx <= winW-218 then
       local fx = currentRows()[selectedFX]
       if fx then
@@ -1164,25 +1775,41 @@ local function loop()
       else
         local answer = reaper.ShowMessageBox("Delete the custom folder '" .. selectedFolder .. "' and its subfolders?\n\nPlugin assignments in those folders will be cleared. Installed plugins will not be deleted.", "Delete custom folder", 4)
         if answer == 6 then
-          local prefix = selectedFolder .. "/"
+          local deleting = selectedFolder
+          local function isInside(path)
+            return path == deleting or path:sub(1, #deleting + 1) == deleting .. "/"
+          end
+
+          -- Remove this folder and every descendant from every plugin assignment.
           for key in pairs(folderMap) do
             local kept = {}
             for _, path in ipairs(assignedPaths(key)) do
-              if not (path == selectedFolder or path:sub(1, #prefix) == prefix) then kept[#kept+1] = path end
+              if not isInside(path) then kept[#kept + 1] = path end
             end
             storeAssignedPaths(key, kept)
           end
+
+          -- Remove the same paths from the saved folder set and ordering,
+          -- including any visual labels saved for the deleted folders.
           for path in pairs(savedFolders) do
-            if path == selectedFolder or path:sub(1, #prefix) == prefix then savedFolders[path] = nil end
+            if isInside(path) then savedFolders[path] = nil end
           end
-          saveMap(folderMap); saveFolders(savedFolders)
+          local hadFolderColors = false
+          for path in pairs(folderColors) do
+            if isInside(path) then folderColors[path] = nil; hadFolderColors = true end
+          end
+          if hadFolderColors then saveFolderColors() end
           local newOrder = {}
           for _, path in ipairs(folderOrder) do
-            if path ~= selectedFolder and path:sub(1, #prefix) ~= prefix then newOrder[#newOrder+1] = path end
+            if not isInside(path) then newOrder[#newOrder + 1] = path end
           end
-          folderOrder = newOrder; saveFolderOrder()
-          status = "Deleted custom folder and its subfolders: " .. selectedFolder
-          selectedFolder = "My Folders"; selectedManufacturer = nil
+          folderOrder = newOrder
+
+          saveMap(folderMap)
+          saveFolders(savedFolders)
+          saveFolderOrder()
+          status = "Deleted custom folder and its subfolders: " .. deleting
+          setBrowserView("My Folders", nil)
           expandedFolders[selectedFolder] = true
         end
       end
@@ -1200,27 +1827,28 @@ local function loop()
           elseif row.kind == "manufacturerHeader" then
             manufacturersExpanded = not manufacturersExpanded
           elseif row.kind == "customHeader" then
-            selectedFolder = "My Folders"
-            selectedManufacturer = nil
+            setBrowserView("My Folders", nil)
             clearSelectionExcept(nil)
             selectedFX = 1; scroll = 0
             status = "My Folders selected. Create Folder makes a top-level folder here."
           elseif row.kind == "manufacturer" then
-            selectedManufacturer = row.value
-            selectedFolder = "All FX"
+            setBrowserView("All FX", row.value)
             -- Selecting a vendor filters the right pane; it never expands plugin rows on the left.
             -- Preserve selected plugin keys and right-pane scroll while browsing the tree.
           elseif row.kind == "toggleFolder" then
             expandedFolders[row.value] = not expandedFolders[row.value]
             -- draw() clamps folderScroll against the newly visible tree on the next frame.
           elseif row.kind == "folder" then
-            selectedFolder = row.value
-            selectedManufacturer = nil
-            if row.value ~= "All FX" and row.value ~= "Unsorted" then dragFolder = row.value end
+            if row.colorX and math.abs(mx-row.colorX) <= 8
+              and row.value ~= "All FX" and row.value ~= "Unsorted" then
+              chooseFolderColor(row.value)
+            else
+              setBrowserView(row.value, nil)
+              if row.value ~= "All FX" and row.value ~= "Unsorted" then dragFolder = row.value end
+            end
             -- Preserve selected plugin keys and list position across tree navigation.
           elseif row.kind == "folderEntry" then
-            selectedFolder = row.value
-            selectedManufacturer = nil
+            setBrowserView(row.value, nil)
             ensureAncestorsExpanded(selectedFolder)
             scroll = 0
             status = "Folder selected: " .. selectedFolder
@@ -1247,7 +1875,9 @@ local function loop()
             dragStartX, dragStartY = mx, my
             if not multi and not shift then
               local clickNow = reaper.time_precise()
-              if math.abs(clickX - mx) < 8 and math.abs(clickY - my) < 8 and (clickNow - clickTime) < 0.45 then addSelected(); clickTime = 0
+              -- A busy project can delay gfx/defer polling; allow a wider
+              -- double-click interval so the second click is not discarded.
+              if math.abs(clickX - mx) < 8 and math.abs(clickY - my) < 8 and (clickNow - clickTime) < 0.90 then addSelected(); clickTime = 0
               else clickTime,clickX,clickY = clickNow,mx,my end
             end
           end
@@ -1276,20 +1906,40 @@ local function loop()
   if not down and mouseWasDown then
     if draggingFolder and dragFolder then
       local mx,my = gfx.mouse_x,gfx.mouse_y
-      local targetRow = nil
+      local targetRow, nearestDistance = nil, math.huge
+      -- Header drops are reserved for pulling a nested folder to the root.
       for _, row in ipairs(rows) do
-        if (row.kind == "folder" or row.kind == "customHeader") and mx >= row.x and mx <= row.x+row.w and my >= row.y and my <= row.y+row.h then
+        if row.kind == "customHeader" and mx >= row.x and mx <= row.x+row.w and my >= row.y and my <= row.y+row.h then
           targetRow = row; break
+        end
+      end
+      -- Otherwise accept a drop on a row OR in the narrow gap immediately
+      -- above/below it. This is what makes the insertion-line gesture usable.
+      if not targetRow and mx >= 14 and mx <= 14 + leftW - 14 and my >= 120 and my <= 120 + listH then
+        for _, row in ipairs(rows) do
+          if row.kind == "folder" and row.value ~= "All FX" and row.value ~= "Unsorted" then
+            local centerY = row.y + row.h / 2
+            local distance = math.abs(my - centerY)
+            if distance < nearestDistance then targetRow, nearestDistance = row, distance end
+          end
         end
       end
       if targetRow and targetRow.kind == "customHeader" then
         moveFolderPath(dragFolder, nil, "root")
       elseif targetRow and targetRow.value ~= "All FX" and targetRow.value ~= "Unsorted" and targetRow.value ~= dragFolder then
+        local insideRow = my >= targetRow.y and my <= targetRow.y + targetRow.h
         local relative = (my - targetRow.y) / math.max(1, targetRow.h)
-        local mode = relative < 0.28 and "before" or (relative > 0.72 and "after" or "inside")
+        local mode
+        if insideRow and relative >= 0.30 and relative <= 0.70 then
+          mode = "inside"
+        elseif my < targetRow.y + targetRow.h / 2 then
+          mode = "before"
+        else
+          mode = "after"
+        end
         moveFolderPath(dragFolder, targetRow.value, mode)
       elseif not targetRow then
-        status = "Drop on a folder to nest/reorder, or on My Folders to pull it to the top level."
+        status = "Drop the folder on a row or on the insertion line between folders."
       else
         status = "Choose a different folder as the destination."
       end
@@ -1297,29 +1947,48 @@ local function loop()
     elseif dragging and dragFX then
       local mx,my = gfx.mouse_x,gfx.mouse_y
       local target = nil
-      for _, row in ipairs(rows) do
-        if row.kind == "folder" and mx >= row.x and mx <= row.x+row.w and my >= row.y and my <= row.y+row.h then
-          target = row.value
-          break
+      -- A plugin drop is accepted only on the visible row of an EXISTING
+      -- custom folder. Use the full left-pane row width, not the indented
+      -- text area: dropping near the left edge of a nested row must still
+      -- select that row rather than miss it or hit an unintended path.
+      if mx >= 14 and mx <= 14 + leftW - 4 then
+        for _, row in ipairs(rows) do
+          if row.kind == "folder" and row.value ~= "All FX" and row.value ~= "Unsorted"
+            and my >= row.y and my <= row.y + row.h then
+            -- Do not synthesize folders from a drag destination. The target
+            -- must already exist in the saved folder tree.
+            if savedFolders[row.value] then target = row.value end
+            break
+          end
         end
       end
-      if target and target ~= "All FX" and target ~= "Unsorted" then
+      if target then
         local targets = {}
-        for _, fx in ipairs(fxList) do if selectedFXKeys[fx.key] then targets[#targets+1] = fx end end
-        if #targets == 0 then targets[1] = dragFX end
-        local added = 0
-        for _, fx in ipairs(targets) do
-          if addFolderAssignment(fx, target) then added = added + 1 end
+        for _, fx in ipairs(fxList) do
+          if selectedFXKeys[fx.key] then targets[#targets+1] = fx end
         end
-        status = ("Added %d plugin(s) to %s; existing folder assignments kept"):format(added, target)
-      elseif target then
-        status = "Drop onto a custom folder, not All FX/Unsorted."
+        if #targets == 0 then targets[1] = dragFX end
+        local moved = 0
+        for _, fx in ipairs(targets) do
+          if assignToFolder(fx, target) then moved = moved + 1 end
+        end
+        status = ("Moved %d plugin(s) to %s"):format(moved, target)
       else
-        status = "Drag cancelled — drop the plugin on a folder name."
+        status = "Drop cancelled — release on the row of an existing custom folder."
       end
     end
     dragFX, dragging = nil, false
     if not draggingFolder then dragFolder = nil end
+  end
+  if searchMouseSelecting then
+    if down then
+      local pos = searchPositionAtX(gfx.mouse_x)
+      searchSelEnd = pos
+      searchCursor = pos
+    else
+      searchMouseSelecting = false
+      if searchSelStart == searchSelEnd then searchSelStart, searchSelEnd = nil, nil end
+    end
   end
   mouseWasDown = down
   local rightDown = (cap & 2) == 2
@@ -1334,22 +2003,63 @@ local function loop()
       end
     end
     if hit then
-      contextMenu = {x=math.min(mx, winW-195), y=math.min(my, winH-56), fx=hit}
-      status = "Plugin menu: " .. hit.name
+      -- Right-clicking an already selected plugin keeps the multi-selection.
+      -- Right-clicking an unselected plugin makes it the sole selection.
+      if not selectedFXKeys[hit.key] then clearSelectionExcept(hit.key) end
+      local selectedCount = 0
+      local visible = currentRows()
+      for _, fx in ipairs(visible) do
+        if selectedFXKeys[fx.key] then selectedCount = selectedCount + 1 end
+      end
+      contextMenu = {x=math.min(mx, winW-195), y=math.min(my, winH-56), fx=hit, selectedCount=math.max(1, selectedCount)}
+      status = selectedCount > 1 and ("Plugin menu: " .. selectedCount .. " selected") or ("Plugin menu: " .. hit.name)
     else
+      local folderHit = nil
+      for _, row in ipairs(rows) do
+        if row.kind == "folder" and row.value ~= "All FX" and row.value ~= "Unsorted"
+          and mx >= row.x and mx <= row.x+row.w and my >= row.y and my <= row.y+row.h then
+          folderHit = row.value
+          break
+        end
+      end
       contextMenu = nil
+      if folderHit then
+        chooseFolderColor(folderHit)
+      end
     end
   end
   rightMouseWasDown = rightDown
 
-  -- Keyboard: type to search; Backspace removes; Enter adds selected; printable ASCII appends.
+  -- Keyboard editing for the search box: caret, selection, Ctrl+A, Delete/Backspace.
   local c = char
-  if c == 27 then searchFocused = false; contextMenu = nil
-  elseif (c == 8 or c == 127) and searchFocused then search = search:sub(1, math.max(0,#search-1)); cursorVisible = true; lastCursorBlink = reaper.time_precise()
-  elseif c == 1 and searchFocused then search = ""; cursorVisible = true; lastCursorBlink = reaper.time_precise()
-  elseif c == 13 then searchFocused = false; addSelected()
-  elseif c == 30064 and searchFocused then search = ""
-  elseif c == 1818584692 then -- F2: assign/move selected plugin
+  local shiftHeld = (cap & 8) == 8
+  local ctrlHeld = (cap & 4) == 4
+  local function deleteSearchSelection()
+    if searchSelStart and searchSelEnd and searchSelStart ~= searchSelEnd then
+      local a,b = searchSelStart, searchSelEnd
+      if a > b then a,b = b,a end
+      search = search:sub(1,a) .. search:sub(b+1)
+      searchCursor = a
+      searchSelStart, searchSelEnd = nil, nil
+      return true
+    end
+    return false
+  end
+  if c == 27 then searchFocused = false; searchMouseSelecting = false; contextMenu = nil
+  elseif searchFocused and (c == 8 or c == 127) then
+    if not deleteSearchSelection() and searchCursor > 0 then
+      search = search:sub(1,searchCursor-1) .. search:sub(searchCursor+1)
+      searchCursor = searchCursor - 1
+    end
+    cursorVisible = true; lastCursorBlink = reaper.time_precise()
+  elseif searchFocused and c == 30064 then
+    if not deleteSearchSelection() and searchCursor < #search then
+      search = search:sub(1,searchCursor) .. search:sub(searchCursor+2)
+    end
+    cursorVisible = true; lastCursorBlink = reaper.time_precise()
+  elseif searchFocused and (c == 1 or (ctrlHeld and (c == 97 or c == 65))) then
+    searchSelStart, searchSelEnd = 0, #search; searchCursor = #search
+  elseif searchFocused and c == 1818584692 then -- F2 remains available for assign/move
     local fx = currentRows()[selectedFX]
     if fx then
       local paths = assignedPaths(fx.key)
@@ -1357,9 +2067,31 @@ local function loop()
       local path = promptFolder(current)
       if path then assignToFolder(fx, path) end
     end
-  elseif c >= 32 and c <= 126 and searchFocused then search = search .. string.char(c); cursorVisible = true; lastCursorBlink = reaper.time_precise()
+  elseif searchFocused and c == 30067 then
+    searchCursor = math.max(0, searchCursor - 1)
+    if shiftHeld then searchSelEnd = searchCursor else searchSelStart, searchSelEnd = nil, nil end
+  elseif searchFocused and c == 30068 then
+    searchCursor = math.min(#search, searchCursor + 1)
+    if shiftHeld then searchSelEnd = searchCursor else searchSelStart, searchSelEnd = nil, nil end
+  elseif searchFocused and c == 30069 then -- Home
+    searchCursor = 0
+    if shiftHeld then searchSelEnd = searchCursor else searchSelStart, searchSelEnd = nil, nil end
+  elseif searchFocused and c == 30070 then -- End
+    searchCursor = #search
+    if shiftHeld then searchSelEnd = searchCursor else searchSelStart, searchSelEnd = nil, nil end
   elseif c == 30065 then scroll = math.max(0,scroll-1)
   elseif c == 30066 then scroll = scroll+1
+  elseif c == 32 and not searchFocused then
+    -- gfx.getchar captures Space while this window is focused, so forward
+    -- the normal REAPER Play/stop command explicitly to the main application.
+    reaper.Main_OnCommand(40044, 0) -- Transport: Play/stop
+  elseif c == 13 then searchFocused = false; addSelected()
+  elseif c >= 32 and c <= 126 and searchFocused then
+    deleteSearchSelection()
+    search = search:sub(1,searchCursor) .. string.char(c) .. search:sub(searchCursor+1)
+    searchCursor = searchCursor + 1
+    searchSelStart, searchSelEnd = nil, nil
+    cursorVisible = true; lastCursorBlink = reaper.time_precise()
   end
 
   if gfx.mouse_wheel ~= 0 then
@@ -1371,19 +2103,20 @@ local function loop()
     gfx.mouse_wheel = 0
   end
 
-  gfx.update()
+  if closeAfterAdd then cleanup(); return end
+  if redraw then gfx.update() end
   reaper.defer(loop)
 end
 
-local geometry = reaper.GetExtState(SECTION, GEOMETRY_KEY)
+local geometry = FolderStorage.getSetting("window_geometry_v1") or ""
 if geometry ~= "" then
   local parts = split(geometry, "|")
   local gw, gh, gx, gy, gd, gl = tonumber(parts[1]), tonumber(parts[2]), tonumber(parts[3]), tonumber(parts[4]), tonumber(parts[5]), tonumber(parts[6])
   if gw and gh and gw >= 700 and gh >= 420 then winW, winH = gw, gh end
   if gl and gl >= 150 and gl <= 700 then leftW = gl end
-  gfx.init("REAPER Nested FX Browser v9 — worker (use launcher)", winW, winH, gd or 0, gx or 0, gy or 0)
+  gfx.init("REAPER Nested FX Browser v9.2", winW, winH, gd or 0, gx or 0, gy or 0)
 else
-  gfx.init("REAPER Nested FX Browser v9 — worker (use launcher)", winW, winH, 0)
+  gfx.init("REAPER Nested FX Browser v9.2", winW, winH, 0)
 end
 gfx.setfont(1, "Arial", 15)
 loop()
